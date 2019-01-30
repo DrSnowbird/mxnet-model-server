@@ -1,4 +1,4 @@
-# Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 (the "License").
 # You may not use this file except in compliance with the License.
 # A copy of the License is located at
@@ -8,163 +8,196 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-import os
-import glob
-import requests
-import zipfile
-import shutil
+"""
+Model loader.
+"""
+import importlib
+import inspect
 import json
-import jsonschema
-import fasteners
+import logging
+import os
+import sys
+import uuid
+from abc import ABCMeta, abstractmethod
 
-from mms.log import get_logger
-from jsonschema import validate
+from builtins import str
+
+from mms.metrics.metrics_store import MetricsStore
+from mms.service import Service
 
 
-logger = get_logger()
-
-URL_PREFIX = ('http://', 'https://', 's3://')
-MANIFEST_DIR = "manifest_schema"
-MANIFEST_SCHEMA_FILE = 'manifest-schema.json'
-MANIFEST_FILENAME = 'MANIFEST.json'
-LOCK_FILE = '/tmp/tmp_lock_file'
-
-@fasteners.interprocess_locked(LOCK_FILE)
-def _download_and_extract(model_location, path=None, overwrite=False):
-    """Download an given URL
-
-    Parameters
-    ----------
-    model_location : str
-        Location for local model or URL to download
-    path : str, optional
-        Destination path to store downloaded file. By default stores to the
-        current directory with same name as in url.
-    overwrite : bool, optional
-        Whether to overwrite destination file if already exists.
-
-    Returns
-    -------
-    str
-        The file path of the downloaded file.
+class ModelLoaderFactory(object):
     """
-    model_file = model_location
-    if model_location.lower().startswith(URL_PREFIX):
-        if path is None:
-            model_file = model_location.split('/')[-1]
-        elif os.path.isdir(path):
-            model_file = os.path.join(path, model_location.split('/')[-1])
+    ModelLoaderFactory
+    """
+
+    @staticmethod
+    def get_model_loader(model_dir):
+        manifest_file = os.path.join(model_dir, "MAR-INF/MANIFEST.json")
+        if os.path.exists(manifest_file):
+            return MmsModelLoader()
         else:
-            model_file = path
+            return LegacyModelLoader()
 
-        if overwrite or not os.path.exists(model_file):
-            dirname = os.path.dirname(os.path.abspath(os.path.expanduser(model_file)))
-            if not os.path.exists(dirname):
-                os.makedirs(dirname)
-
-            print('Downloading %s from %s...' % (model_file, model_location))
-            r = requests.get(model_location, stream=True)
-            if r.status_code != 200:
-                raise RuntimeError("Failed downloading url %s" % model_location)
-            with open("%s.temp" % (model_file), 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024):
-                    if chunk:  # filter out keep-alive new chunks
-                        f.write(chunk)
-            os.rename("%s.temp" % (model_file), model_file)
-
-    model_file = os.path.abspath(model_file)
-    [model_name, model_extension] = os.path.splitext(os.path.basename(model_file))
-    model_file_prefix = model_name if model_extension == '.model' else model_file
-
-    model_dir = os.path.join(os.path.dirname(model_file), model_file_prefix)
-
-    if not os.path.isdir(model_dir):
-        os.mkdir(model_dir)
-        try:
-            if '.model' in model_file:
-                _extract_zip(model_file, model_dir)
-        except Exception as e:
-            raise Exception('Failed to open model file %s for model %s. Stacktrace: %s'
-                            % (model_file, model_file_prefix , e))
-    return model_dir
-
-def _extract_zip(zip_file, destination):
-    '''Extract zip to destination without keeping directory structure
-
-        Parameters
-        ----------
-        zip_file : str
-            Path to zip file.
-        destination : str
-            Destination directory.
-    '''
-    with zipfile.ZipFile(zip_file) as file_buf:
-        for item in file_buf.namelist():
-            filename = os.path.basename(item)
-            # skip directories
-            if not filename:
-                continue
-
-            # copy file (taken from zipfile's extract)
-            source = file_buf.open(item)
-            target = open(os.path.join(destination, filename), 'wb')
-            with source, target:
-                shutil.copyfileobj(source, target)
-
-def _extract_model(service_name, path):
-    if path.endswith('.onnx') or path.endswith('.pb2'):
-        raise ValueError('Convert ONNX model using mxnet-model-export before serving.')
-
-    model_dir = _download_and_extract(model_location=path, overwrite=True)
-        
-    try:
-        #manifest schema
-        import mms
-        mms_pkg_loc = os.path.split(mms.__file__)[0]
-        manifest_schema_file = os.path.join(mms_pkg_loc, MANIFEST_DIR, MANIFEST_SCHEMA_FILE)
-
-        assert os.path.isfile(manifest_schema_file), \
-               "manifest-schema file missing mms pkg location:%s" % mms_pkg_loc
-
-        schema = json.load(open(manifest_schema_file))
-        manifest = json.load(open(os.path.join(model_dir, MANIFEST_FILENAME)))
-    except Exception as e:
-        raise Exception('Failed to open manifest file. Stacktrace: ' + str(e))
-
-    validate(manifest, schema)
-
-    assert len(glob.glob(os.path.join(model_dir, manifest['Model']['Signature']))) == 1, \
-    'Signature file in model archive is inconsistent with manifest.'
-
-    assert len(glob.glob(os.path.join(model_dir, manifest['Model']['Symbol']))) == 1, \
-    'Symbol file in model archive is inconsistent with manifest.'
-
-    assert len(glob.glob(os.path.join(model_dir, manifest['Model']['Parameters']))) == 1, \
-    'Parameter file in model archive is inconsistent with manifest.'
-
-    assert len(glob.glob(os.path.join(model_dir, manifest['Model']['Service']))) == 1, \
-    'Service file in model archive is inconsistent with manifest.'
-
-    model_name = manifest['Model']['Model-Name']
-            
-    return service_name, model_name, model_dir, manifest
 
 class ModelLoader(object):
-    """Model Loader
     """
-    @staticmethod
-    def load(models):
-        """
-        Load models 
+    Base Model Loader class.
+    """
+    __metaclass__ = ABCMeta
 
-        Parameters
-        ----------
-        models : dict
-            Model name and model path pairs
-            
-        Returns
-        ----------
-        list
-            (Model Name, Model Path, Model Schema) tuple list
+    @abstractmethod
+    def load(self, model_name, model_dir, handler, gpu_id, batch_size):
         """
-        return list(map(lambda model: _extract_model(model[0], model[1]), models.items()))
+        Load model from file.
+
+        :param model_name:
+        :param model_dir:
+        :param handler:
+        :param gpu_id:
+        :param batch_size:
+        :return: Model
+        """
+        pass
+
+    @staticmethod
+    def list_model_services(module, parent_class=None):
+        """
+        Parse user defined module to get all model service classes in it.
+
+        :param module:
+        :param parent_class:
+        :return: List of model service class definitions
+        """
+
+        # Parsing the module to get all defined classes
+        classes = [cls[1] for cls in inspect.getmembers(module, lambda member: inspect.isclass(member) and
+                                                        member.__module__ == module.__name__)]
+        # filter classes that is subclass of parent_class
+        if parent_class is not None:
+            return [c for c in classes if issubclass(c, parent_class)]
+
+        return classes
+
+
+class MmsModelLoader(ModelLoader):
+    """
+    MMS 1.0 Model Loader
+    """
+
+    def load(self, model_name, model_dir, handler, gpu_id, batch_size):
+        """
+        Load MMS 1.0 model from file.
+
+        :param model_name:
+        :param model_dir:
+        :param handler:
+        :param gpu_id:
+        :param batch_size:
+        :return:
+        """
+        logging.debug("Loading model - working dir: %s", os.getcwd())
+
+        # TODO: Request ID is not given. UUID is a temp UUID.
+        metrics = MetricsStore(uuid.uuid4(), model_name)
+        manifest_file = os.path.join(model_dir, "MAR-INF/MANIFEST.json")
+        manifest = None
+        if os.path.exists(manifest_file):
+            with open(manifest_file) as f:
+                manifest = json.load(f)
+
+        temp = handler.split(":", 1)
+        module_name = temp[0]
+        function_name = None if len(temp) == 1 else temp[1]
+        if module_name.endswith(".py"):
+            module_name = module_name[:-3]
+
+        module = importlib.import_module(module_name)
+        if module is None:
+            raise ValueError("Unable to load module {}, make sure it is added to python path".format(module_name))
+        if function_name is None:
+            function_name = "handle"
+        if hasattr(module, function_name):
+            entry_point = getattr(module, function_name)
+            service = Service(model_name, model_dir, manifest, entry_point, gpu_id, batch_size)
+
+            service.context.metrics = metrics
+            # initialize model at load time
+            entry_point(None, service.context)
+        else:
+            model_class_definitions = ModelLoader.list_model_services(module)
+            if len(model_class_definitions) != 1:
+                raise ValueError("Expected only one class in custom service code or a function entry point")
+
+            model_class = model_class_definitions[0]
+            model_service = model_class()
+            handle = getattr(model_service, "handle")
+            if handle is None:
+                raise ValueError("Expect handle method in class {}".format(str(model_class)))
+
+            service = Service(model_name, model_dir, manifest, model_service.handle, gpu_id, batch_size)
+            initialize = getattr(model_service, "initialize")
+            if initialize is not None:
+                # noinspection PyBroadException
+                try:
+                    model_service.initialize(service.context)
+                    # pylint: disable=broad-except
+                except Exception:
+                    # noinspection PyBroadException
+                    try:
+                        sys.exc_clear()
+                        # pylint: disable=broad-except
+                    except Exception:
+                        pass
+
+        return service
+
+
+class LegacyModelLoader(ModelLoader):
+    """
+    MMS 0.4 Model Loader
+    """
+
+    def load(self, model_name, model_dir, handler, gpu_id, batch_size):
+        """
+        Load MMS 0.3 model from file.
+
+        :param model_name:
+        :param model_dir:
+        :param handler:
+        :param gpu_id:
+        :param batch_size:
+        :return:
+        """
+        manifest_file = os.path.join(model_dir, "MANIFEST.json")
+        with open(manifest_file) as f:
+            manifest = json.load(f)
+        if not handler.endswith(".py"):
+            handler = handler + ".py"
+
+        service_file = os.path.join(model_dir, handler)
+        name = os.path.splitext(os.path.basename(service_file))[0]
+        if sys.version_info[0] > 2:
+            from importlib import util
+
+            spec = util.spec_from_file_location(name, service_file)
+            module = util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        else:
+            import imp
+            module = imp.load_source(name, service_file)
+
+        if module is None:
+            raise ValueError("Unable to load module {}".format(service_file))
+
+        from mms.model_service.mxnet_model_service import SingleNodeService
+
+        model_class_definitions = ModelLoader.list_model_services(module, SingleNodeService)
+        module_class = model_class_definitions[0]
+
+        module = module_class(model_name, model_dir, manifest, gpu_id)
+        service = Service(model_name, model_dir, manifest, module.handle, gpu_id, batch_size)
+
+        module.initialize(service.context)
+
+        return service

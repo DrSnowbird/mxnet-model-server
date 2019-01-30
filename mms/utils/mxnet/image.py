@@ -8,14 +8,16 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
+"""
+Image utils
+"""
 import sys
-import numpy as np
-import mxnet as mx
 import base64
-
-from PIL import Image
-from mxnet import image as img
 from io import BytesIO
+import numpy as np
+from PIL import Image
+import mxnet as mx
+from mxnet import image as img
 
 
 def transform_shape(img_arr, dim_order='NCHW'):
@@ -35,7 +37,7 @@ def transform_shape(img_arr, dim_order='NCHW'):
     output : NDArray
         Image in NDArray format with dim_order shape
     """
-    assert dim_order == 'NCHW' or dim_order == 'NHWC', "dim_order must be 'NCHW' or 'NHWC'."
+    assert dim_order in 'NCHW' or dim_order in 'NHWC', "dim_order must be 'NCHW' or 'NHWC'."
     if dim_order == 'NCHW':
         img_arr = mx.nd.transpose(img_arr, (2, 0, 1))
     output = mx.nd.expand_dims(img_arr, axis=0)
@@ -76,7 +78,8 @@ def read(buf, flag=1, to_rgb=True, out=None):
     return img.imdecode(buf, flag, to_rgb, out)
 
 
-def write(img_arr, flag=1, format='jpeg', dim_order='CHW'):
+# TODO: Check where this is used and rename format
+def write(img_arr, flag=1, format='jpeg', dim_order='CHW'):  # pylint: disable=redefined-builtin
     """Write an NDArray to a base64 string
 
     Parameters
@@ -95,9 +98,9 @@ def write(img_arr, flag=1, format='jpeg', dim_order='CHW'):
     str
         Image in base64 string format
     """
-    assert dim_order == 'CHW' or dim_order == 'HWC', "dim_order must be 'CHW' or 'HWC'."
+    assert dim_order in 'CHW' or dim_order in 'HWC', "dim_order must be 'CHW' or 'HWC'."
     if dim_order == 'CHW':
-        img_arr = mx.nd.transpose(img_arr, (1,2,0))
+        img_arr = mx.nd.transpose(img_arr, (1, 2, 0))
     if flag == 1:
         mode = 'RGB'
     else:

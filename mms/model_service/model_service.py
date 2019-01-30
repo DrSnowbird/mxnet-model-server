@@ -10,33 +10,52 @@
 
 """`ModelService` defines an API for base model service.
 """
+# pylint: disable=W0223
 
+import ast
+import json
+import logging
 import os
-import sys
 import time
-from abc import ABCMeta, abstractmethod, abstractproperty
-
-from mms.log import get_logger
-from mms.metrics_manager import MetricsManager
-
-logger = get_logger()
-URL_PREFIX = ('http://', 'https://', 's3://')
+from abc import ABCMeta, abstractmethod
 
 
 class ModelService(object):
-    '''ModelService wraps up all preprocessing, inference and postprocessing
+    """
+    ModelService wraps up all preprocessing, inference and postprocessing
     functions used by model service. It is defined in a flexible manner to
     be easily extended to support different frameworks.
-    '''
+    """
     __metaclass__ = ABCMeta
 
-    def __init__(self, model_name, model_dir, manifest, gpu=None):
+    # noinspection PyUnusedLocal
+    def __init__(self, model_name, model_dir, manifest, gpu=None):  # pylint: disable=unused-argument
         self.ctx = None
+        self._context = None
+        self._signature = None
+
+    def initialize(self, context):
+        """
+        Internal initialize ModelService.
+
+        :param context: MMS context object
+        :return:
+        """
+        self._context = context
+        properties = context.system_properties
+        model_dir = properties.get("model_dir")
+
+        signature_file_path = os.path.join(model_dir, context.manifest['Model']['Signature'])
+        if not os.path.isfile(signature_file_path):
+            raise ValueError("Signature file is not found.")
+
+        with open(signature_file_path) as f:
+            self._signature = json.load(f)
 
     @abstractmethod
     def inference(self, data):
-        '''
-        Wrapper function to run preprocess, inference and postprocess functions.
+        """
+        Wrapper function to run pre-process, inference and post-process functions.
 
         Parameters
         ----------
@@ -47,39 +66,75 @@ class ModelService(object):
         -------
         list of outputs to be sent back to client.
             data to be sent back
-        '''
+        """
         pass
 
     @abstractmethod
     def ping(self):
-        '''Ping to get system's health.
+        """
+        Ping to get system's health.
 
         Returns
         -------
         String
             A message, "health": "healthy!", to show system is healthy.
-        '''
+        """
         pass
 
-    @abstractproperty
     def signature(self):
-        '''Signiture for model service.
+        """
+        Signature for model service.
 
         Returns
         -------
         Dict
-            Model service signiture.
-        '''
-        pass
+            Model service signature.
+        """
+        return self._signature
+
+    # noinspection PyUnusedLocal
+    def handle(self, data, context):  # pylint: disable=unused-argument
+        """
+        Backward compatible handle function.
+
+        :param data:
+        :param context:
+        :return:
+
+        """
+        input_type = self._signature['input_type']
+
+        input_data = []
+        data_name = self._signature["inputs"][0]["data_name"]
+        form_data = data[0].get(data_name)
+        if form_data is None:
+            form_data = data[0].get("body")
+
+        if form_data is None:
+            form_data = data[0].get("data")
+
+        if input_type == "application/json":
+            # user might not send content in HTTP request
+            if isinstance(form_data, (bytes, bytearray)):
+                form_data = ast.literal_eval(form_data.decode("utf-8"))
+
+        input_data.append(form_data)
+
+        ret = self.inference(input_data)
+        if isinstance(ret, list):
+            return ret
+
+        return [ret]
 
 
 class SingleNodeService(ModelService):
-    '''SingleNodeModel defines abstraction for model service which loads a
+    """
+    SingleNodeModel defines abstraction for model service which loads a
     single model.
-    '''
+    """
 
     def inference(self, data):
-        '''
+        """
         Wrapper function to run preprocess, inference and postprocess functions.
 
         Parameters
@@ -91,33 +146,24 @@ class SingleNodeService(ModelService):
         -------
         list of outputs to be sent back to client.
             data to be sent back
-        '''
-        pre_start_time = time.time()
+        """
+        preprocess_start = time.time()
         data = self._preprocess(data)
-        infer_start_time = time.time()
-
-        # Update preprocess latency metric
-        pre_time_in_ms = (infer_start_time - pre_start_time) * 1000
-        if self.model_name + '_LatencyPreprocess' in MetricsManager.metrics:
-            MetricsManager.metrics[self.model_name + '_LatencyPreprocess'].update(pre_time_in_ms)
-
+        inference_start = time.time()
         data = self._inference(data)
+        postprocess_start = time.time()
         data = self._postprocess(data)
+        end_time = time.time()
 
-        # Update inference latency metric
-        infer_time_in_ms = (time.time() - infer_start_time) * 1000
-        if self.model_name + '_LatencyInference' in MetricsManager.metrics:
-            MetricsManager.metrics[self.model_name + '_LatencyInference'].update(infer_time_in_ms)
-
-        # Update overall latency metric
-        if self.model_name + '_LatencyOverall' in MetricsManager.metrics:
-            MetricsManager.metrics[self.model_name + '_LatencyOverall'].update(pre_time_in_ms + infer_time_in_ms)
+        logging.info("preprocess time: %.2f", (inference_start - preprocess_start) * 1000)
+        logging.info("inference time: %.2f", (postprocess_start - inference_start) * 1000)
+        logging.info("postprocess time: %.2f", (end_time - postprocess_start) * 1000)
 
         return data
 
     @abstractmethod
     def _inference(self, data):
-        '''
+        """
         Internal inference methods. Run forward computation and
         return output.
 
@@ -130,11 +176,11 @@ class SingleNodeService(ModelService):
         -------
         list of NDArray
             Inference output.
-        '''
+        """
         return data
 
     def _preprocess(self, data):
-        '''
+        """
         Internal preprocess methods. Do transformation on raw
         inputs and convert them to NDArray.
 
@@ -147,11 +193,11 @@ class SingleNodeService(ModelService):
         -------
         list of NDArray
             Processed inputs in NDArray format.
-        '''
+        """
         return data
 
     def _postprocess(self, data):
-        '''
+        """
         Internal postprocess methods. Do transformation on inference output
         and convert them to MIME type objects.
 
@@ -164,30 +210,5 @@ class SingleNodeService(ModelService):
         -------
         list of object
             list of outputs to be sent back.
-        '''
+        """
         return data
-
-
-class MultiNodesService(ModelService):
-    pass
-
-
-def load_service(path, name=None):
-    try:
-        if not name:
-            name = os.path.splitext(os.path.basename(path))[0]
-
-        module = None
-        if sys.version_info[0] > 2:
-            import importlib
-            spec = importlib.util.spec_from_file_location(name, path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-
-        else:
-            import imp
-            module = imp.load_source(name, path)
-
-        return module
-    except Exception:
-        raise Exception('Incorrect or missing service file: ' + path)

@@ -8,3 +8,10 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
+"""
+MXNet Utils
+"""
+import warnings
+
+warnings.warn("Module mms.utils.mxnet is deprecated, please avoid using mms internal modules.",
+              DeprecationWarning, stacklevel=2)

@@ -1,3 +1,5 @@
+.gradle
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -45,6 +47,7 @@ nosetests.xml
 coverage.xml
 *.cover
 .hypothesis/
+.pytest_cache/
 
 # Translations
 *.mo
@@ -114,3 +117,6 @@ ENV/
 
 # Pictures
 *.jpg
+
+# Prop file in benchmark
+benchmarks/*.properties
